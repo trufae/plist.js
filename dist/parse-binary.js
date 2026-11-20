@@ -1,0 +1,218 @@
+import { assertSafeKey } from './safe-key.js';
+const EPOCH_2001 = 978307200000; // ms between 1970-01-01 and 2001-01-01
+function readSizedInt(view, offset, size) {
+    switch (size) {
+        case 1: return view.getUint8(offset);
+        case 2: return view.getUint16(offset);
+        case 4: return view.getUint32(offset);
+        case 8: {
+            const hi = view.getUint32(offset);
+            const lo = view.getUint32(offset + 4);
+            // For values that fit in safe integer range
+            return hi * 0x100000000 + lo;
+        }
+        default:
+            throw new Error(`Unsupported int size: ${size}`);
+    }
+}
+/**
+ * Parse a binary plist (bplist00 format) into a PlistValue.
+ */
+export function parseBinary(data) {
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const len = data.byteLength;
+    // Validate header
+    const header = String.fromCharCode(...data.subarray(0, 8));
+    if (header !== 'bplist00') {
+        throw new Error('Invalid binary plist: bad magic');
+    }
+    if (len < 8 + 32) {
+        throw new Error('Invalid binary plist: file too short');
+    }
+    // Read trailer (last 32 bytes)
+    const trailerOffset = len - 32;
+    const offsetTableOffsetSize = view.getUint8(trailerOffset + 6);
+    const objectRefSize = view.getUint8(trailerOffset + 7);
+    const numObjects = readSizedInt(view, trailerOffset + 8, 8);
+    const topObject = readSizedInt(view, trailerOffset + 16, 8);
+    const offsetTableOffset = readSizedInt(view, trailerOffset + 24, 8);
+    if (![1, 2, 4, 8].includes(offsetTableOffsetSize) || ![1, 2, 4, 8].includes(objectRefSize)) {
+        throw new Error('Invalid binary plist: bad trailer int size');
+    }
+    if (numObjects < 1 ||
+        topObject >= numObjects ||
+        offsetTableOffset < 8 ||
+        offsetTableOffset + numObjects * offsetTableOffsetSize > trailerOffset) {
+        throw new Error('Invalid binary plist: bad trailer');
+    }
+    // Read offset table
+    const offsets = [];
+    for (let i = 0; i < numObjects; i++) {
+        const objOffset = readSizedInt(view, offsetTableOffset + i * offsetTableOffsetSize, offsetTableOffsetSize);
+        if (objOffset < 8 || objOffset >= offsetTableOffset) {
+            throw new Error(`Invalid binary plist: bad offset for object ${i}`);
+        }
+        offsets.push(objOffset);
+    }
+    // Each object is parsed at most once. Without this, objects referenced
+    // from multiple places would be re-parsed every time, allowing a small
+    // input to expand exponentially. The cache is keyed by byte offset rather
+    // than object index, since several offset table entries may point at the
+    // same offset. `inProgress` detects reference cycles.
+    const cache = new Map();
+    const inProgress = new Set();
+    // Objects at distinct offsets can still overlap one another's bytes, so a
+    // crafted file could describe many large strings or collections that share
+    // the same payload and expand quadratically. Every object (collection refs,
+    // string characters) must lie within the object area, and a well-formed
+    // file never materializes more payload bytes than that area holds, so
+    // anything beyond it is rejected.
+    const objectAreaEnd = offsetTableOffset;
+    let budget = objectAreaEnd - 8;
+    function claim(offset, byteLength) {
+        if (!Number.isSafeInteger(byteLength) || byteLength > objectAreaEnd - offset) {
+            throw new Error('Invalid binary plist: object extends past object area');
+        }
+        budget -= byteLength;
+        if (budget < 0) {
+            throw new Error('Invalid binary plist: overlapping objects');
+        }
+    }
+    function readRef(offset) {
+        const ref = readSizedInt(view, offset, objectRefSize);
+        if (ref >= numObjects) {
+            throw new Error(`Invalid binary plist: object ref ${ref} out of range`);
+        }
+        return ref;
+    }
+    function parseObject(index) {
+        const objOffset = offsets[index];
+        const cached = cache.get(objOffset);
+        if (cached !== undefined)
+            return cached;
+        if (inProgress.has(objOffset)) {
+            throw new Error('Invalid binary plist: circular object reference');
+        }
+        inProgress.add(objOffset);
+        try {
+            const value = parseObjectUncached(objOffset);
+            // Date and data objects are mutable and cheap to recreate, so don't
+            // share instances between references to avoid surprising aliasing
+            if (!(value instanceof Date) && !(value instanceof Uint8Array)) {
+                cache.set(objOffset, value);
+            }
+            return value;
+        }
+        finally {
+            inProgress.delete(objOffset);
+        }
+    }
+    function parseObjectUncached(objOffset) {
+        let offset = objOffset;
+        const marker = view.getUint8(offset);
+        const type = marker >> 4;
+        let size = marker & 0x0f;
+        offset++;
+        // Read extended size
+        if (type !== 0 && type !== 8 && size === 0x0f) {
+            const extMarker = view.getUint8(offset);
+            offset++;
+            const extSize = 1 << (extMarker & 0x0f);
+            size = readSizedInt(view, offset, extSize);
+            offset += extSize;
+        }
+        switch (type) {
+            case 0x0: // singletons
+                if (marker === 0x00)
+                    return null;
+                if (marker === 0x08)
+                    return false;
+                if (marker === 0x09)
+                    return true;
+                throw new Error(`Unknown singleton: 0x${marker.toString(16)}`);
+            case 0x1: { // int
+                const byteCount = 1 << size;
+                if (byteCount <= 4) {
+                    return readSizedInt(view, offset, byteCount);
+                }
+                if (byteCount === 8) {
+                    const hi = view.getInt32(offset);
+                    const lo = view.getUint32(offset + 4);
+                    return hi * 0x100000000 + lo;
+                }
+                if (byteCount === 16) {
+                    // Written for values from 2^63 up to 2^64 - 1 (CoreFoundation,
+                    // plistlib); read as a signed 128 bit int like they do
+                    const hi = view.getBigInt64(offset);
+                    const lo = view.getBigUint64(offset + 8);
+                    return Number((hi << 64n) | lo);
+                }
+                throw new Error(`Unsupported int size: ${byteCount}`);
+            }
+            case 0x2: { // real
+                const byteCount = 1 << size;
+                if (byteCount === 4)
+                    return view.getFloat32(offset);
+                if (byteCount === 8)
+                    return view.getFloat64(offset);
+                throw new Error(`Unsupported real size: ${byteCount}`);
+            }
+            case 0x3: { // date
+                const timestamp = view.getFloat64(offset);
+                return new Date(timestamp * 1000 + EPOCH_2001);
+            }
+            case 0x4: { // data
+                // A view onto the input, not a copy, so not charged to the budget
+                if (size > objectAreaEnd - offset) {
+                    throw new Error('Invalid binary plist: object extends past object area');
+                }
+                return new Uint8Array(data.buffer, data.byteOffset + offset, size);
+            }
+            case 0x5: { // ASCII string
+                claim(offset, size);
+                let s = '';
+                for (let i = 0; i < size; i++) {
+                    s += String.fromCharCode(view.getUint8(offset + i));
+                }
+                return s;
+            }
+            case 0x6: { // UTF-16BE string
+                claim(offset, size * 2);
+                let s = '';
+                for (let i = 0; i < size; i++) {
+                    s += String.fromCharCode(view.getUint16(offset + i * 2));
+                }
+                return s;
+            }
+            case 0x8: { // UID
+                const byteCount = size + 1;
+                return { UID: readSizedInt(view, offset, byteCount) };
+            }
+            case 0xa: { // array
+                claim(offset, size * objectRefSize);
+                const arr = [];
+                for (let i = 0; i < size; i++) {
+                    const ref = readRef(offset + i * objectRefSize);
+                    arr.push(parseObject(ref));
+                }
+                return arr;
+            }
+            case 0xd: { // dict
+                claim(offset, size * 2 * objectRefSize);
+                const dict = {};
+                for (let i = 0; i < size; i++) {
+                    const keyRef = readRef(offset + i * objectRefSize);
+                    const valRef = readRef(offset + (size + i) * objectRefSize);
+                    const key = parseObject(keyRef);
+                    assertSafeKey(key);
+                    dict[key] = parseObject(valRef);
+                }
+                return dict;
+            }
+            default:
+                throw new Error(`Unknown object type: 0x${type.toString(16)}`);
+        }
+    }
+    return parseObject(topObject);
+}
+//# sourceMappingURL=parse-binary.js.map

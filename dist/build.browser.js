@@ -1,0 +1,114 @@
+/**
+ * Encode a Uint8Array into a base64 string.
+ */
+function uint8ArrayToBase64(bytes) {
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+const XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8"?>';
+const DOCTYPE = '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">';
+const INVALID_XML_CHARS = /[\0-\x08\x0B\f\x0E-\x1F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?:[^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g;
+/**
+ * Generate an XML plist string from the input object `obj`.
+ *
+ * @param obj - the object to convert
+ * @param opts - optional options object
+ * @returns converted plist XML string
+ */
+export function build(obj, opts) {
+    const pretty = !opts || opts.pretty !== false;
+    const indent = opts?.indent ?? '  ';
+    const newline = opts?.newline ?? '\n';
+    const invalidCharReplacement = opts?.invalidCharReplacement;
+    const lines = [];
+    function emit(depth, line) {
+        if (pretty) {
+            lines.push(indent.repeat(depth) + line);
+        }
+        else {
+            lines.push(line);
+        }
+    }
+    function walk(value, depth) {
+        if (typeof value === 'undefined') {
+            return;
+        }
+        else if (Array.isArray(value)) {
+            emit(depth, '<array>');
+            for (let i = 0; i < value.length; i++) {
+                walk(value[i], depth + 1);
+            }
+            emit(depth, '</array>');
+        }
+        else if (value instanceof ArrayBuffer) {
+            emit(depth, '<data>' + uint8ArrayToBase64(new Uint8Array(value)) + '</data>');
+        }
+        else if (ArrayBuffer.isView(value)) {
+            const bytes = value instanceof Uint8Array
+                ? value
+                : new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+            emit(depth, '<data>' + uint8ArrayToBase64(bytes) + '</data>');
+        }
+        else if (typeof value === 'object' && value !== null && !(value instanceof Date)) {
+            emit(depth, '<dict>');
+            for (const prop in value) {
+                if (Object.hasOwn(value, prop)) {
+                    const val = value[prop];
+                    if (val === undefined || val === null)
+                        continue;
+                    emit(depth + 1, '<key>' + escapeXml(prop, invalidCharReplacement) + '</key>');
+                    walk(val, depth + 1);
+                }
+            }
+            emit(depth, '</dict>');
+        }
+        else if (typeof value === 'number') {
+            const tag = Number.isInteger(value) && Math.abs(value) < 1e21 ? 'integer' : 'real';
+            emit(depth, '<' + tag + '>' + value.toString() + '</' + tag + '>');
+        }
+        else if (typeof value === 'bigint') {
+            emit(depth, '<integer>' + value.toString() + '</integer>');
+        }
+        else if (value instanceof Date) {
+            emit(depth, '<date>' + new Date(value).toISOString().replace(/\.000Z$/, 'Z') + '</date>');
+        }
+        else if (typeof value === 'boolean') {
+            emit(depth, value ? '<true/>' : '<false/>');
+        }
+        else if (typeof value === 'string') {
+            const escaped = escapeXml(value, invalidCharReplacement);
+            emit(depth, escaped ? '<string>' + escaped + '</string>' : '<string/>');
+        }
+    }
+    walk(obj, 1);
+    const sep = pretty ? newline : '';
+    const innerContent = lines.join(sep);
+    const parts = [];
+    if (!opts?.headless) {
+        parts.push(XML_DECLARATION, DOCTYPE);
+    }
+    parts.push('<plist version="1.0">', innerContent, '</plist>');
+    return parts.join(sep);
+}
+function escapeXml(str, invalidCharReplacement) {
+    const escaped = str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        // A literal carriage return in text content is normalized to a line feed
+        // when the plist is parsed back (XML line-ending normalization), so encode
+        // it as a character reference to keep `parse(build(x))` lossless. This
+        // matches the Node `build()`, which emits `&#xD;` via `xmlbuilder`.
+        .replace(/\r/g, '&#xD;');
+    if (invalidCharReplacement !== undefined) {
+        return escaped.replace(INVALID_XML_CHARS, invalidCharReplacement);
+    }
+    if (escaped.match(INVALID_XML_CHARS)) {
+        throw new Error(`Invalid character in string: ${escaped}`);
+    }
+    return escaped;
+}
+//# sourceMappingURL=build.browser.js.map
